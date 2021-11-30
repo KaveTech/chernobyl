@@ -1,23 +1,51 @@
-version: "3.4"
 x-restart-policy: &restart_policy
   restart: unless-stopped
+x-depends_on-healthy: &depends_on-healthy
+  condition: service_healthy
+x-depends_on-default: &depends_on-default
+  condition: service_started
+x-healthcheck-defaults: &healthcheck_defaults
+  # Avoid setting the interval too small, as docker uses much more CPU than one would expect.
+  # Related issues:
+  # https://github.com/moby/moby/issues/39102
+  # https://github.com/moby/moby/issues/39388
+  # https://github.com/getsentry/onpremise/issues/1000
+  interval: 30s
+  timeout: 5s
+  retries: 5
+  start_period: 10s
 x-sentry-defaults: &sentry_defaults
   <<: *restart_policy
   image: "$SENTRY_IMAGE"
   depends_on:
-    - redis
-    - memcached
-    - smtp
-    - snuba-api
-    - snuba-consumer
-    - snuba-outcomes-consumer
-    - snuba-sessions-consumer
-    - snuba-transactions-consumer
-    - snuba-subscription-consumer-events
-    - snuba-subscription-consumer-transactions
-    - snuba-replacer
-    - symbolicator
-    - kafka
+    redis:
+      <<: *depends_on-healthy
+    kafka:
+      <<: *depends_on-healthy
+    postgres:
+      <<: *depends_on-healthy
+    memcached:
+      <<: *depends_on-default
+    smtp:
+      <<: *depends_on-default
+    snuba-api:
+      <<: *depends_on-default
+    snuba-consumer:
+      <<: *depends_on-default
+    snuba-outcomes-consumer:
+      <<: *depends_on-default
+    snuba-sessions-consumer:
+      <<: *depends_on-default
+    snuba-transactions-consumer:
+      <<: *depends_on-default
+    snuba-subscription-consumer-events:
+      <<: *depends_on-default
+    snuba-subscription-consumer-transactions:
+      <<: *depends_on-default
+    snuba-replacer:
+      <<: *depends_on-default
+    symbolicator:
+      <<: *depends_on-default
   entrypoint: "/etc/sentry/entrypoint.sh"
   command: ["run", "web"]
   environment:
@@ -29,19 +57,32 @@ x-sentry-defaults: &sentry_defaults
     DATABASE_PASSWORD: ${DATABASE_PASSWORD}
     DATABASE_HOST: ${DATABASE_HOST}
     DATABASE_PORT: ${DATABASE_PORT}
+    # Force everything to use the system CA bundle
+    # This is mostly needed to support installing custom CA certs
+    # This one is used by botocore
+    DEFAULT_CA_BUNDLE: &ca_bundle "/etc/ssl/certs/ca-certificates.crt"
+    # This one is used by requests
+    REQUESTS_CA_BUNDLE: *ca_bundle
+    # This one is used by grpc/google modules
+    GRPC_DEFAULT_SSL_ROOTS_FILE_PATH_ENV_VAR: *ca_bundle
     # Leaving the value empty to just pass whatever is set
     # on the host system (or in the .env file)
     SENTRY_EVENT_RETENTION_DAYS:
+    SENTRY_MAIL_HOST:
   volumes:
     - "sentry-data:/data"
     - "./sentry:/etc/sentry"
     - "./geoip:/geoip:ro"
+    - "./certificates:/usr/local/share/ca-certificates:ro"
 x-snuba-defaults: &snuba_defaults
   <<: *restart_policy
   depends_on:
-    - redis
-    - clickhouse
-    - kafka
+    clickhouse:
+      <<: *depends_on-healthy
+    kafka:
+      <<: *depends_on-healthy
+    redis:
+      <<: *depends_on-healthy
   image: "$SNUBA_IMAGE"
   environment:
     SNUBA_SETTINGS: docker
@@ -57,15 +98,23 @@ services:
   smtp:
     <<: *restart_policy
     image: tianon/exim4
+    hostname: ${SENTRY_MAIL_HOST:-''}
     volumes:
       - "sentry-smtp:/var/spool/exim4"
       - "sentry-smtp-log:/var/log/exim4"
   memcached:
     <<: *restart_policy
-    image: "memcached:1.5-alpine"
+    image: "memcached:1.6.9-alpine"
+    healthcheck:
+      <<: *healthcheck_defaults
+      # From: https://stackoverflow.com/a/31877626/5155484
+      test: echo stats | nc 127.0.0.1 11211
   redis:
     <<: *restart_policy
-    image: "redis:5.0-alpine"
+    image: "redis:6.2.4-alpine"
+    healthcheck:
+      <<: *healthcheck_defaults
+      test: redis-cli ping
     volumes:
       - "sentry-redis:/data"
     ulimits:
@@ -86,14 +135,14 @@ services:
       - "sentry-zookeeper-log:/var/lib/zookeeper/log"
       - "sentry-secrets:/etc/zookeeper/secrets"
     healthcheck:
-      test: ["CMD-SHELL", 'echo "ruok" | nc -w 2 -q 2 localhost 2181 | grep imok']
-      interval: 10s
-      timeout: 5s
-      retries: 6
+      <<: *healthcheck_defaults
+      test:
+        ["CMD-SHELL", 'echo "ruok" | nc -w 2 -q 2 localhost 2181 | grep imok']
   kafka:
     <<: *restart_policy
     depends_on:
-      - zookeeper
+      zookeeper:
+        <<: *depends_on-healthy
     image: "confluentinc/cp-kafka:5.5.0"
     environment:
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
@@ -118,10 +167,8 @@ services:
       - "sentry-kafka-log:/var/lib/kafka/log"
       - "sentry-secrets:/etc/kafka/secrets"
     healthcheck:
-      test: ["CMD-SHELL", 'nc -z localhost 9092']
-      interval: 10s
-      timeout: 5s
-      retries: 6
+      <<: *healthcheck_defaults
+      test: ["CMD-SHELL", "nc -z localhost 9092"]
   clickhouse:
     <<: *restart_policy
     image: "yandex/clickhouse-server:20.3.9.70"
@@ -141,8 +188,17 @@ services:
       # If you have high volume and your search return incomplete results
       # You might want to change this to a higher value (and ensure your host has enough memory)
       MAX_MEMORY_USAGE_RATIO: 0.3
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -nv -t1 --spider 'http://localhost:8123/' || exit 1",
+        ]
+      interval: 3s
+      timeout: 600s
+      retries: 200
   geoipupdate:
-    image: "maxmindinc/geoipupdate:latest"
+    image: "maxmindinc/geoipupdate:v4.7.1"
     # Override the entrypoint in order to avoid using envvars for config.
     # Futz with settings so we can keep mmdb and conf in same dir on host
     # (image looks for them in separate dirs by default).
@@ -217,6 +273,14 @@ services:
       - "sentry-symbolicator:/data"
   web:
     <<: *sentry_defaults
+    healthcheck:
+      <<: *healthcheck_defaults
+      test:
+        - "CMD"
+        - "/bin/bash"
+        - '-c'
+        # Courtesy of https://unix.stackexchange.com/a/234089/108960
+        - 'exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e "GET /_health/ HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n" >&3 && grep ok -s -m 1 <&3'
   cron:
     <<: *sentry_defaults
     command: run cron
@@ -249,7 +313,7 @@ services:
     <<: *restart_policy
     ports:
       - "$SENTRY_BIND:80/tcp"
-    image: "nginx:1.16"
+    image: "nginx:1.21.4-alpine"
     volumes:
       - type: bind
         read_only: true
@@ -271,9 +335,12 @@ services:
         source: ./geoip
         target: /geoip
     depends_on:
-      - kafka
-      - redis
-      - web
+      kafka:
+        <<: *depends_on-healthy
+      redis:
+        <<: *depends_on-healthy
+      web:
+        <<: *depends_on-healthy
 volumes:
   sentry-data:
     external: true

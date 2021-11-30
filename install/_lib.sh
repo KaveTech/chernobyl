@@ -6,13 +6,18 @@ log_file="sentry_install_log-`date +'%Y-%m-%d_%H-%M-%S'`.txt"
 exec &> >(tee -a "$log_file")
 
 # Work from /install/ for install.sh, project root otherwise
-if [[ "$(basename $0)" = "install.sh" || "$(basename $0)" = "test.sh" ]]; then
+if [[ "$(basename $0)" = "install.sh"  ]]; then
   cd "$(dirname $0)/install/"
 else
-  cd "$(dirname $0)"  # assume we're a *-test.sh script
+  cd "$(dirname $0)"  # assume we're a test script or some such
 fi
 
-_ENV="$(realpath ../.env)"
+# Allow `.env` overrides using the `.env.custom` file
+if [[ -f "../.env.custom" ]]; then
+  _ENV="$(realpath ../.env.custom)"
+else
+  _ENV="$(realpath ../.env)"
+fi
 
 # Read .env for default values with a tip o' the hat to https://stackoverflow.com/a/59831605/90297
 t=$(mktemp) && export -p > "$t" && set -a && . $_ENV && set +a && . "$t" && rm "$t" && unset t
@@ -25,7 +30,8 @@ else
   _endgroup=""
 fi
 
-dc="docker-compose --no-ansi"
+dc_base="$(docker compose version &> /dev/null && echo 'docker compose' || echo 'docker-compose')"
+dc="$dc_base --ansi never --env-file ${_ENV}"
 dcr="$dc run --rm"
 
 # A couple of the config files are referenced from other subscripts, so they
